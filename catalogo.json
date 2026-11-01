@@ -44,6 +44,18 @@
       "icone": "https://raw.githubusercontent.com/hdldev123/central-hdl/main/icones/mesa-pauta.png",
       "cor": "#2B4FD8",
       "tag": "mesa-pauta"
+    },
+    {
+      "id": "bussola",
+      "nome": "Bússola",
+      "descricao": "Assistente com IA sobre os projetos da HDL: lê os repositórios, mostra as skills e gera prompts para o Claude Code.",
+      "categoria": "Desenvolvimento",
+      "repo": "hdldev123/bussola-releases",
+      "nomeWindows": "Bussola",
+      "executavel": "Bussola.exe",
+      "icone": "https://raw.githubusercontent.com/hdldev123/central-hdl/main/icones/bussola.png",
+      "cor": "#f5b83d",
+      "tag": "bussola"
     }
   ]
 }
