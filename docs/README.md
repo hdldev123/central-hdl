@@ -24,8 +24,14 @@ O manual operacional (publicar versões, colocar um app no catálogo) continua n
 3. Publicar a Central na Microsoft Store, do jeito que ela funciona hoje, **não passa** nas regras da Store e não tiraria o aviso do instalador baixado do site.
 4. A recomendação é não mexer agora e decidir juntos se vale pagar por um certificado de assinatura. Isso depende de **para quem** a Central vai ser distribuída (só equipe ou clientes também).
 
+## Como esta branch é mantida
+
+- **É uma branch só de documentação, viva.** Ela **não vira PR e não é mesclada** em `staging`, `main` nem em nenhuma outra branch.
+- **Cada vez que a pesquisa avançar** (cotação de certificado, resposta da Microsoft, teste de MSIX, decisão dos sócios), o conteúdo daqui é atualizado com um commit novo, e o [registro da pesquisa](05-registro-da-pesquisa.md) ganha uma entrada com a data.
+- Quando decidirmos **construir** a solução, o código vai numa branch `feature/...` própria, criada a partir da `main`, seguindo o fluxo normal da HDL. Esta branch continua sendo a referência do estudo.
+
 ## Como ler no GitHub
 
 Abra a branch `feature/docs-central-e-assinatura-digital` no repositório `hdldev123/central-hdl` e entre na pasta `docs/`. O GitHub mostra os documentos formatados, com os diagramas.
 
-Comentários e dúvidas: abra uma *issue* ou comente direto no PR desta branch, se ele for aberto.
+Comentários e dúvidas: abra uma *issue* no repositório citando esta branch.

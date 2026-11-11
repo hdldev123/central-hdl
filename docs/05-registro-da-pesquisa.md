@@ -36,6 +36,15 @@ Antes de implementar, a decisão foi **avaliar se compensa** e discutir.
 | Quantas vezes o aviso aparece hoje? | Uma vez por pessoa (primeira instalação da Central). Atualizações e apps instalados pela Central não mostram o aviso. |
 | Recomendação | Não seguir com a Store agora. Orientar no convite e decidir sobre o certificado conforme o público da Central. Detalhes no [documento 4](04-alternativas-e-recomendacao.md). |
 
+## Histórico de atualizações
+
+Toda vez que o estudo avançar, acrescente uma linha aqui (a mais recente embaixo).
+
+| Data | O que avançou |
+|---|---|
+| 10/11/2026 | Avaliação da Microsoft Store: não compensa como está (regras 10.1.5/10.1.6 e virtualização do MSIX). |
+| 11/11/2026 | Documentação criada nesta branch para o estudo com os sócios. Decisão: a branch fica só para documentação, sem PR nem merge, e é atualizada a cada avanço. |
+
 ## O que não foi verificado
 
 - Se a conta de empresa na Store é mesmo gratuita desde maio/2026 (informação do briefing).
