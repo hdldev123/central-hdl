@@ -172,3 +172,5 @@ npm run dist       # gera o instalador em dist/ sem publicar
 ## Assinatura de código (recomendado depois)
 
 Os executáveis não são assinados. Na **primeira** instalação da Central (e do Prosa baixado pelo navegador), o Windows SmartScreen mostra "O Windows protegeu o computador" › *Mais informações* › *Executar assim mesmo*. As atualizações feitas pela Central não passam por esse aviso. Para eliminá-lo, é preciso um certificado de assinatura de código (configurado em `build.win` no electron-builder).
+
+O estudo das opções (certificado, Azure Artifact Signing, Microsoft Store) está em [docs/](docs/README.md).
