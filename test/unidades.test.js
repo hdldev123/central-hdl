@@ -4,9 +4,11 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseLatestYml, compareVersions, download, latestRelease } from '../lib/releases.js';
-import { parseRegistry, findInstalled, folderOf } from '../lib/windows.js';
+import { execFileSync } from 'node:child_process';
+import { parseLatestYml, compareVersions, download, latestRelease, latestPackage } from '../lib/releases.js';
+import { parseRegistry, findInstalled, folderOf, chaveAumid, programaDoRegistro } from '../lib/windows.js';
 import { entrar, renovar, perfil, sair, cadastrar } from '../lib/conta.js';
+import { lerInstalado, instalarPacote, removerInstalado, recuperarTrocas, esperarAte } from '../lib/gerenciados.js';
 import { validateCatalog } from '../lib/catalog.js';
 import { createLog } from '../lib/log.js';
 import { appRestrito, temAcesso } from '../lib/acesso.js';
@@ -24,7 +26,7 @@ test('latest.yml do electron-builder', () => {
     '',
   ].join('\r\n');
   assert.deepEqual(parseLatestYml(yml), {
-    version: '0.4.0', file: 'Prosa-Setup-0.4.0.exe', sha512: 'BBBtopo==', size: 121705106, releaseDate: '2026-10-25T12:00:00.000Z',
+    version: '0.4.0', file: 'Prosa-Setup-0.4.0.exe', sha512: 'BBBtopo==', size: 121705106, releaseDate: '2026-10-25T12:00:00.000Z', appId: null,
   });
   assert.throws(() => parseLatestYml('version: 1.0.0'), /incompleto/);
 });
@@ -65,6 +67,18 @@ test('registro do Windows: apps instalados', () => {
   assert.match(entries[0].values.QuietUninstallString, /Uninstall Prosa\.exe" \/currentuser \/S$/);
   assert.equal(folderOf('"C:\\Users\\x\\Programs\\Prosa\\Uninstall Prosa.exe" /currentuser'), 'C:\\Users\\x\\Programs\\Prosa');
   assert.equal(folderOf(''), null);
+  // do usuário (HKCU) a Central remove sozinha; de todos os usuários (HKLM) pede UAC
+  assert.equal(programaDoRegistro(entries[0]).maquina, false);
+  assert.equal(programaDoRegistro(entries[0]).uninstall, entries[0].values.QuietUninstallString);
+  const maquina = parseRegistry([
+    'HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\guid',
+    '    DisplayName    REG_SZ    Fluxo 1.2.0',
+    '    UninstallString    REG_SZ    "C:\\Program Files\\Fluxo\\Uninstall Fluxo.exe" /allusers',
+  ].join('\r\n'))[0];
+  assert.deepEqual(programaDoRegistro(maquina), {
+    displayName: 'Fluxo 1.2.0', version: null, location: 'C:\\Program Files\\Fluxo',
+    uninstall: '"C:\\Program Files\\Fluxo\\Uninstall Fluxo.exe" /allusers /S', maquina: true,
+  });
 });
 
 test('download confere o SHA-512 e apaga arquivo adulterado', async () => {
@@ -303,4 +317,140 @@ test('perfil: regras do banco, conta removida e banco sem a função', async () 
   assert.equal(sem.regras, null);
   const rede = await perfil(servidor(() => { throw new TypeError('fetch failed'); }), cfg, 't');
   assert.equal(rede.regras, null);
+});
+
+const CENTRAL_YML = [
+  'version: 1.3.0',
+  'path: Fluxo-1.3.0-win.zip',
+  'sha512: ZZZpacote==',
+  'size: 153974102',
+  'appId: br.hdl.fluxo',
+  "releaseDate: '2026-11-22T19:48:09.208Z'",
+  '',
+].join('\n');
+
+test('central.yml: lê o appId e recusa valor inválido', () => {
+  assert.deepEqual(parseLatestYml(CENTRAL_YML), {
+    version: '1.3.0', file: 'Fluxo-1.3.0-win.zip', sha512: 'ZZZpacote==', size: 153974102,
+    releaseDate: '2026-11-22T19:48:09.208Z', appId: 'br.hdl.fluxo',
+  });
+  assert.equal(parseLatestYml(CENTRAL_YML.replace('br.hdl.fluxo', 'a b/c')).appId, null);
+});
+
+test('latestPackage: 404 é null; 200 devolve o pacote com a URL de download', async () => {
+  assert.equal(await latestPackage(async () => new Response('', { status: 404 }), 'dono/repo'), null);
+  let pedido = null;
+  const ok = await latestPackage(async (url) => { pedido = url; return new Response(CENTRAL_YML); }, 'dono/repo');
+  assert.equal(pedido, 'https://github.com/dono/repo/releases/latest/download/central.yml');
+  assert.equal(ok.formato, 'pacote');
+  assert.equal(ok.appId, 'br.hdl.fluxo');
+  assert.equal(ok.url, 'https://github.com/dono/repo/releases/download/v1.3.0/Fluxo-1.3.0-win.zip');
+  assert.equal(ok.notesUrl, 'https://github.com/dono/repo/releases/tag/v1.3.0');
+  await assert.rejects(latestPackage(async () => new Response('', { status: 500 }), 'dono/repo'), /500/);
+});
+
+test('latestRelease marca o formato instalador', async () => {
+  const yml = 'version: 1.0.0\npath: Setup.exe\nsha512: abc==\n';
+  assert.equal((await latestRelease(async () => new Response(yml), 'dono/repo')).formato, 'instalador');
+});
+
+const TAR = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
+
+/** Monta um .zip de verdade com o tar do Windows: o .exe na raiz e resources/ como no win-unpacked. */
+function montarZip(dir, nome, { exe = 'App.exe', marca = 'v1' } = {}) {
+  const fonte = fs.mkdtempSync(path.join(dir, 'fonte-'));
+  fs.mkdirSync(path.join(fonte, 'resources'));
+  if (exe) fs.writeFileSync(path.join(fonte, exe), marca);
+  fs.writeFileSync(path.join(fonte, 'resources', 'app.asar'), marca);
+  fs.writeFileSync(path.join(fonte, 'resources', 'app-update.yml'), 'provider: github');
+  const zip = path.join(dir, nome);
+  execFileSync(TAR, ['-a', '-cf', zip, '-C', fonte, '.']);
+  return zip;
+}
+
+test('pacote: instala, atualiza, preserva a versão em uso se o pacote for ruim e remove', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'central-teste-'));
+  const base = path.join(dir, 'apps');
+  const opts = { appId: 'br.hdl.fluxo', executavel: 'App.exe' };
+  try {
+    assert.equal(lerInstalado(base, 'fluxo'), null);
+
+    // primeira instalação
+    await instalarPacote(base, 'fluxo', montarZip(dir, 'v1.zip', { marca: 'v1' }), { ...opts, versao: '1.0.0' });
+    const ger = lerInstalado(base, 'fluxo');
+    assert.deepEqual(ger, { versao: '1.0.0', appId: 'br.hdl.fluxo', pasta: path.join(base, 'fluxo', 'app') });
+    assert.equal(fs.readFileSync(path.join(ger.pasta, 'App.exe'), 'utf8'), 'v1');
+    assert.equal(fs.existsSync(path.join(ger.pasta, 'resources', 'app-update.yml')), false);
+    assert.equal(fs.existsSync(path.join(ger.pasta, 'resources', 'app.asar')), true);
+    const json = JSON.parse(fs.readFileSync(path.join(base, 'fluxo', 'instalado.json'), 'utf8'));
+    assert.equal(json.versao, '1.0.0');
+    assert.equal(json.appId, 'br.hdl.fluxo');
+    assert.deepEqual(fs.readdirSync(path.join(base, 'fluxo')).sort(), ['app', 'instalado.json']);
+
+    // atualização: troca e apaga a versão antiga
+    await instalarPacote(base, 'fluxo', montarZip(dir, 'v2.zip', { marca: 'v2' }), { ...opts, versao: '2.0.0' });
+    assert.equal(lerInstalado(base, 'fluxo').versao, '2.0.0');
+    assert.equal(fs.readFileSync(path.join(ger.pasta, 'App.exe'), 'utf8'), 'v2');
+    assert.deepEqual(fs.readdirSync(path.join(base, 'fluxo')).sort(), ['app', 'instalado.json']);
+
+    // pacote sem o exe: erro e a versão em uso continua
+    await assert.rejects(
+      instalarPacote(base, 'fluxo', montarZip(dir, 'ruim.zip', { exe: null }), { ...opts, versao: '3.0.0' }),
+      /não tem o App\.exe/,
+    );
+    assert.equal(lerInstalado(base, 'fluxo').versao, '2.0.0');
+    assert.equal(fs.readFileSync(path.join(ger.pasta, 'App.exe'), 'utf8'), 'v2');
+    assert.deepEqual(fs.readdirSync(path.join(base, 'fluxo')).sort(), ['app', 'instalado.json']);
+
+    // sem o json ou sem a pasta app, não conta como instalado
+    fs.rmSync(path.join(base, 'fluxo', 'instalado.json'));
+    assert.equal(lerInstalado(base, 'fluxo'), null);
+    fs.writeFileSync(path.join(base, 'fluxo', 'instalado.json'), '{"versao":"2.0.0"}');
+    assert.equal(lerInstalado(base, 'fluxo').versao, '2.0.0');
+    fs.rmSync(path.join(base, 'fluxo', 'app'), { recursive: true });
+    assert.equal(lerInstalado(base, 'fluxo'), null);
+
+    await instalarPacote(base, 'fluxo', montarZip(dir, 'v4.zip'), { ...opts, versao: '4.0.0' });
+    assert.equal(removerInstalado(base, 'fluxo'), true);
+    assert.equal(fs.existsSync(path.join(base, 'fluxo')), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pacote: troca interrompida (app/ já virou antigo/) é recuperada na abertura e na instalação seguinte', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'central-teste-'));
+  const base = path.join(dir, 'apps');
+  const opts = { appId: 'br.hdl.fluxo', executavel: 'App.exe' };
+  const interromper = () => fs.renameSync(path.join(base, 'fluxo', 'app'), path.join(base, 'fluxo', 'antigo'));
+  try {
+    await instalarPacote(base, 'fluxo', montarZip(dir, 'v1.zip', { marca: 'v1' }), { ...opts, versao: '1.0.0' });
+
+    // abertura da Central
+    interromper();
+    assert.equal(lerInstalado(base, 'fluxo'), null);
+    assert.deepEqual(recuperarTrocas(base), ['fluxo']);
+    assert.equal(lerInstalado(base, 'fluxo').versao, '1.0.0');
+    assert.deepEqual(recuperarTrocas(base), []);
+    assert.deepEqual(recuperarTrocas(path.join(dir, 'nao-existe')), []);
+
+    // a instalação seguinte não apaga a única cópia antes de recuperá-la; se o pacote for ruim, ela continua
+    interromper();
+    await assert.rejects(instalarPacote(base, 'fluxo', montarZip(dir, 'ruim.zip', { exe: null }), { ...opts, versao: '2.0.0' }));
+    assert.equal(lerInstalado(base, 'fluxo').versao, '1.0.0');
+    assert.equal(fs.readFileSync(path.join(base, 'fluxo', 'app', 'App.exe'), 'utf8'), 'v1');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('esperarAte: resolve quando a condição vira verdadeira e desiste no prazo', async () => {
+  let pronto = false;
+  setTimeout(() => { pronto = true; }, 200);
+  assert.equal(await esperarAte(async () => pronto, { ms: 5000, intervalo: 50 }), true);
+  assert.equal(await esperarAte(async () => false, { ms: 150, intervalo: 50 }), false);
+});
+
+test('notificações: chave do AppUserModelID no registro do usuário', () => {
+  assert.equal(chaveAumid('br.hdl.fluxo'), 'HKCU\\Software\\Classes\\AppUserModelId\\br.hdl.fluxo');
 });
