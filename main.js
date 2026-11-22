@@ -10,8 +10,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { latestRelease, download, compareVersions } from './lib/releases.js';
-import { installedPrograms, findInstalled, isRunning, hasWindow, kill, runInstaller, runUninstall } from './lib/windows.js';
+import { latestRelease, latestPackage, download, compareVersions } from './lib/releases.js';
+import { installedPrograms, findInstalled, isRunning, hasWindow, kill, runInstaller, runUninstall, registrarAumid, removerAumid } from './lib/windows.js';
+import { pastaApps, lerInstalado, instalarPacote, removerInstalado, recuperarTrocas, esperarAte } from './lib/gerenciados.js';
 import { validateCatalog } from './lib/catalog.js';
 import { appRestrito, temAcesso } from './lib/acesso.js';
 import { createLog } from './lib/log.js';
@@ -25,6 +26,8 @@ const CATALOG_TIMEOUT_MS = 30 * 1000;
 const CATALOG_TTL_MS = 5 * 60 * 1000; // o raw.githubusercontent também guarda cache por uns 5 min
 const WINDOW_WAIT_MS = 20 * 1000; // ao abrir um app, quanto esperar pela janela dele
 const HIDDEN_ARG = '--oculto';
+const ICON_TIMEOUT_MS = 15 * 1000;
+const APPS = pastaApps(); // apps instalados pela própria Central
 
 app.setName('Central HDL');
 app.setAppUserModelId('br.hdl.central');
@@ -42,6 +45,8 @@ let tray = null;
 let quitting = false;
 const busy = new Map();       // appId -> 'preparando' | 'baixando' | 'instalando' | 'desinstalando'
 const notified = new Set();   // avisos já mostrados nesta sessão ("id@versão", "falha:id@versão")
+const moverDepois = new Map(); // appId -> quando tentar de novo trazer para a Central, depois de uma falha
+const MOVER_FALHA_ESPERA_MS = 6 * 60 * 60 * 1000;
 
 // ------------------------------------------------------------ preferências
 const CONFIG_FILE = () => path.join(app.getPath('userData'), 'config.json');
@@ -260,22 +265,49 @@ const minhasRegras = () => sessao?.perfil?.regras ?? null;
  * administradores). A Central só esconde: quem garante de verdade é o banco de cada app.
  */
 const acessoAoApp = (a) => temAcesso(a, minhasTags(), minhasRegras());
+/**
+ * Com a Central sem conta (saiu, ou a sessão caiu), quem já tem o app continua abrindo e atualizando,
+ * como quando cada app se atualizava sozinho: quem exige a conta é o banco do app.
+ */
+const acessoAoAppInstalado = (a, instalado) => acessoAoApp(a) || (!sessao && Boolean(instalado));
+
+/** Instalação do app: a da Central (pasta dela) e a antiga (instalador próprio, no registro do Windows). */
+const instalacoes = (a, programs) => ({ ger: lerInstalado(APPS, a.id), legado: findInstalled(programs, a.nomeWindows ?? a.nome) });
+
+/**
+ * Última versão do app. Pacote (central.yml) é o formato da Central; o instalador antigo só serve
+ * para app ainda não instalado por ela, enquanto o app não publica o pacote. Nunca roda o instalador
+ * NSIS sobre um app gerenciado: ele recriaria os atalhos. null: versão sendo publicada agora.
+ */
+async function ultimaVersao(a, gerenciado) {
+  const pacote = await latestPackage(net.fetch, a.repo);
+  if (pacote) return pacote;
+  if (!gerenciado) return latestRelease(net.fetch, a.repo);
+  // O publicar cria a release antes de gerar os arquivos e sobe o central.yml por último: sem nenhum
+  // dos dois, a versão está saindo agora (alguns minutos). Só com o latest.yml é versão sem pacote.
+  const instalador = await latestRelease(net.fetch, a.repo).catch(() => null);
+  if (!instalador) return null;
+  throw new Error('A última versão ainda não tem o pacote para a Central. Avise a equipe da HDL.');
+}
 
 /** Estado de cada app: versão instalada, última publicada, se está aberto. fresh: relê o catálogo do GitHub. */
 async function collectState({ fresh = false } = {}) {
   const [catalog, programs] = await Promise.all([loadCatalog({ fresh }), installedPrograms()]);
   const apps = await Promise.all((catalog.apps ?? []).map(async (a) => {
-    const inst = findInstalled(programs, a.nomeWindows ?? a.nome);
-    const acesso = acessoAoApp(a);
+    const { ger, legado } = instalacoes(a, programs);
+    const inst = ger || legado;
+    const acesso = acessoAoAppInstalado(a, inst);
+    // instalação antiga "para todos os usuários": removê-la pede UAC, então só com um clique da pessoa
+    const legadoDoUsuario = Boolean(legado && !legado.maquina);
     // sem acesso, só aparece se já estiver instalado (para poder desinstalar)
     if (!acesso && !inst) return null;
     let latest = null;
     let erro = null;
-    try { latest = await latestRelease(net.fetch, a.repo); } catch (err) {
+    try { latest = await ultimaVersao(a, ger); } catch (err) {
       erro = err.message;
       log.warn(`${a.id}: não foi possível consultar a última versão (${err.message})`);
     }
-    const installed = inst ? inst.version ?? '0.0.0' : null;
+    const installed = ger ? ger.versao : (legado ? legado.version ?? '0.0.0' : null);
     return {
       id: a.id,
       nome: a.nome,
@@ -289,6 +321,13 @@ async function collectState({ fresh = false } = {}) {
       ultima: latest ? { versao: latest.version, data: latest.releaseDate, tamanho: latest.size, notas: latest.notesUrl } : null,
       // quem perdeu o acesso não recebe versões novas
       atualizacao: Boolean(acesso && installed && latest && compareVersions(latest.version, installed) > 0),
+      gerenciado: Boolean(ger),
+      // instalado pelo instalador antigo e já dá para trazer para a Central sozinha
+      mover: Boolean(acesso && legadoDoUsuario && !ger && latest?.formato === 'pacote'),
+      // só a instalação antiga "para todos os usuários": a atualização automática não mexe nela (pediria UAC)
+      soMaquina: Boolean(legado?.maquina && !ger),
+      // a instalação antiga sobrou ao lado da cópia da Central (remoção falhou ou o instalador rodou de novo)
+      limpar: Boolean(ger && legadoDoUsuario),
       rodando: installed ? await isRunning(a.executavel) : false,
       ocupado: busy.get(a.id) ?? null,
       tag: appRestrito(a, minhasRegras()) ? a.id : null,
@@ -322,36 +361,46 @@ async function install(id, { fechar = false, segundoPlano = false } = {}) {
   let dir = null;
   try {
     const a = await catalogEntry(id);
-    if (!acessoAoApp(a)) throw new Error(`Você não tem acesso ao ${a.nome}. Peça a um administrador da HDL.`);
-    const wasRunning = await isRunning(a.executavel);
-    if (wasRunning && !fechar) return { precisaFechar: true };
+    const { ger, legado } = instalacoes(a, await installedPrograms());
+    if (!acessoAoAppInstalado(a, ger || legado)) throw new Error(`Você não tem acesso ao ${a.nome}. Peça a um administrador da HDL.`);
+    if (await isRunning(a.executavel) && !fechar) return { precisaFechar: true };
     setBusy(id, 'baixando');
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'central-hdl-'));
-    const release = await latestRelease(net.fetch, a.repo);
-    log.info(`${id}: instalando a versão ${release.version}${segundoPlano ? ' (automático)' : ''}`);
+    const release = await ultimaVersao(a, ger);
+    if (!release) throw new Error(`A versão nova do ${a.nome} está sendo publicada agora. Tente de novo em alguns minutos.`);
+    log.info(`${id}: instalando a versão ${release.version} (${release.formato})${segundoPlano ? ' (automático)' : ''}`);
     const file = path.join(dir, path.basename(release.file));
     await download(net.fetch, release, file, (got, total) => send('progresso', { id, got, total }));
     setBusy(id, 'instalando');
-    if (await isRunning(a.executavel)) await kill(a.executavel);
-    try {
-      await runInstaller(file);
-    } catch (err) {
-      if (err.exitCode !== 2) throw err;
-      // Abortado pelo script: costuma ser arquivo ainda preso. Fecha de novo, espera e repete;
-      // se falhar outra vez e o usuário pediu, abre o instalador com telas para mostrar o motivo.
-      log.warn(`${id}: instalador interrompido (código 2); tentando de novo`);
-      await kill(a.executavel);
-      await new Promise((r) => setTimeout(r, 2000));
+    // Pode ter sido aberto durante o download (pelo nome do .exe: vale também a cópia antiga).
+    // Sem permissão para fechar, fica para depois; fechado agora, é reaberto no fim.
+    const aberto = await isRunning(a.executavel);
+    if (aberto && !fechar) return { precisaFechar: true };
+    if (aberto) await kill(a.executavel);
+    let legadoRemovido = null;
+    if (release.formato === 'pacote') {
+      legadoRemovido = await instalarGerenciado(a, release, file, { podeElevar: !segundoPlano });
+    } else {
       try {
         await runInstaller(file);
-      } catch (again) {
-        if (segundoPlano || again.exitCode !== 2) throw again;
-        await runInstaller(file, { silent: false });
+      } catch (err) {
+        if (err.exitCode !== 2) throw err;
+        // Abortado pelo script: costuma ser arquivo ainda preso. Fecha de novo, espera e repete;
+        // se falhar outra vez e o usuário pediu, abre o instalador com telas para mostrar o motivo.
+        log.warn(`${id}: instalador interrompido (código 2); tentando de novo`);
+        await kill(a.executavel);
+        await new Promise((r) => setTimeout(r, 2000));
+        try {
+          await runInstaller(file);
+        } catch (again) {
+          if (segundoPlano || again.exitCode !== 2) throw again;
+          await runInstaller(file, { silent: false });
+        }
       }
     }
-    if (wasRunning) launch(a).catch((err) => log.warn(`${id}: não foi possível reabrir (${err.message})`));
+    if (aberto) launch(a).catch((err) => log.warn(`${id}: não foi possível reabrir (${err.message})`));
     log.info(`${id}: versão ${release.version} instalada`);
-    return { versao: release.version };
+    return { versao: release.version, legadoRemovido };
   } catch (err) {
     log.error(`${id}: falha ao instalar (${err.message})`);
     throw err;
@@ -359,6 +408,80 @@ async function install(id, { fechar = false, segundoPlano = false } = {}) {
     setBusy(id, null);
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
   }
+}
+
+/** Instala o pacote na pasta da Central e remove a instalação antiga (atalhos e Aplicativos instalados), se houver. */
+async function instalarGerenciado(a, release, file, { podeElevar }) {
+  await instalarPacote(APPS, a.id, file, { versao: release.version, appId: release.appId, executavel: a.executavel });
+  const removido = await removerLegado(a, { podeElevar }).catch((err) => {
+    log.warn(`${a.id}: não foi possível remover a instalação antiga (${err.message}); a verificação de 30 min tenta de novo`);
+    return false;
+  });
+  // depois da remoção do antigo: o desinstalador antigo mexe no AppUserModelID
+  await registrarNotificacoes(a, release.appId);
+  return removido;
+}
+
+const LEGADO_ESPERA_MS = 90 * 1000;
+
+/**
+ * Remove a instalação feita pelo instalador próprio do app (atalhos e entrada em Aplicativos instalados).
+ * Os dados e o login do app ficam em %APPDATA%\<App>; o desinstalador não mexe neles. Só com o app
+ * fechado: o desinstalador antigo fecha processos pelo nome do .exe, inclusive a cópia da Central.
+ * A de "todos os usuários" pede UAC: só com `podeElevar` (a pessoa clicou). true se não sobrou nada.
+ */
+async function removerLegado(a, { podeElevar = false } = {}) {
+  const nome = a.nomeWindows ?? a.nome;
+  const legado = findInstalled(await installedPrograms(), nome);
+  if (!legado) return true;
+  if (legado.maquina && !podeElevar) {
+    log.info(`${a.id}: instalação antiga é de todos os usuários (pede UAC); fica até a pessoa atualizar ou desinstalar pela Central`);
+    return false;
+  }
+  if (!legado.uninstall) throw new Error('O Windows não informou como desinstalar a instalação antiga.');
+  await runUninstall(legado.uninstall);
+  // O desinstalador NSIS se copia para a pasta temporária e o processo original termina antes de
+  // acabar; a entrada em Aplicativos instalados é a última coisa que ele apaga.
+  const removida = await esperarAte(async () => !findInstalled(await installedPrograms(), nome), { ms: LEGADO_ESPERA_MS, intervalo: 1000 });
+  if (!removida) throw new Error('o desinstalador antigo não terminou a tempo');
+  log.info(`${a.id}: instalação antiga removida (atalhos e entrada em Aplicativos instalados)`);
+  return true;
+}
+
+/** Sem atalho no menu Iniciar, as notificações do app dependem do AppUserModelID registrado. */
+async function registrarNotificacoes(a, appId) {
+  if (!appId) return;
+  try {
+    await registrarAumid(appId, a.nome, await baixarIcone(a));
+  } catch (err) {
+    log.warn(`${a.id}: não foi possível registrar as notificações (${err.message})`);
+  }
+}
+
+/** Tira a instalação antiga que sobrou ao lado da cópia da Central, sem reinstalar. Nunca com o app aberto. */
+async function limparLegado(a) {
+  reserve(a.id, 'preparando');
+  try {
+    if (await isRunning(a.executavel)) return;
+    if (await removerLegado(a)) await registrarNotificacoes(a, lerInstalado(APPS, a.id)?.appId);
+  } finally {
+    setBusy(a.id, null);
+  }
+}
+
+/** Guarda o ícone do catálogo para as notificações do app; sem conseguir baixar, usa o que já existir. */
+async function baixarIcone(a) {
+  const destino = path.join(APPS, a.id, 'icone.png');
+  if (a.icone) {
+    try {
+      const res = await net.fetch(a.icone, { signal: AbortSignal.timeout(ICON_TIMEOUT_MS) });
+      if (!res.ok) throw new Error(`respondeu ${res.status}`);
+      fs.writeFileSync(destino, Buffer.from(await res.arrayBuffer()));
+    } catch (err) {
+      log.warn(`${a.id}: não foi possível baixar o ícone (${err.message})`);
+    }
+  }
+  return fs.existsSync(destino) ? destino : null;
 }
 
 async function installedEntry(a) {
@@ -374,8 +497,9 @@ async function installedEntry(a) {
  */
 async function launch(a, etapa = () => {}) {
   etapa('verificando');
-  const inst = await installedEntry(a);
-  const exe = path.join(inst.location ?? path.join(process.env.LOCALAPPDATA ?? '', 'Programs', a.nome), a.executavel);
+  const ger = lerInstalado(APPS, a.id);
+  const pasta = ger ? ger.pasta : ((await installedEntry(a)).location ?? path.join(process.env.LOCALAPPDATA ?? '', 'Programs', a.nome));
+  const exe = path.join(pasta, a.executavel);
   if (!fs.existsSync(exe)) throw new Error(`Não encontrei ${a.executavel}. Reinstale o app.`);
   etapa('iniciando');
   const err = await shell.openPath(exe);
@@ -393,10 +517,22 @@ async function uninstall(id) {
   reserve(id, 'desinstalando');
   try {
     const a = await catalogEntry(id);
-    const inst = await installedEntry(a);
-    if (!inst.uninstall) throw new Error('O Windows não informou como desinstalar este app.');
+    const { ger, legado } = instalacoes(a, await installedPrograms());
+    if (!ger && !legado) throw new Error(`${a.nome} não está instalado.`);
     if (await isRunning(a.executavel)) await kill(a.executavel);
-    await runUninstall(inst.uninstall);
+    // A antiga primeiro: se ela falhar (ou a pessoa recusar o UAC), a cópia da Central fica, senão a
+    // rotina de 30 min veria só a antiga e traria o app de volta sozinha.
+    if (legado) {
+      try {
+        await removerLegado(a, { podeElevar: true });
+      } catch (err) {
+        throw new Error(`Não foi possível remover a instalação antiga do ${a.nome} (${err.message}).`);
+      }
+    }
+    if (ger) {
+      if (!removerInstalado(APPS, id)) log.warn(`${id}: sobraram arquivos presos na pasta do app; saem na próxima instalação`);
+      if (ger.appId) await removerAumid(ger.appId);
+    }
     log.info(`${id}: desinstalado`);
   } catch (err) {
     log.error(`${id}: falha ao desinstalar (${err.message})`);
@@ -420,13 +556,16 @@ async function backgroundCheck() {
     updateTray(pending.length);
     log.info(`verificação: ${apps.length} app(s), ${pending.length} com atualização${pending.length ? ` (${pending.map((a) => `${a.id} ${a.ultima.versao}`).join(', ')})` : ''}`);
     const auto = readConfig().atualizarSozinho;
+    const movidos = []; // { nome, removido }: vieram do instalador antigo para a pasta da Central
     for (const a of pending) {
-      // apps abertos não são interrompidos: só avisa
-      if (auto && !a.rodando && !busy.has(a.id)) {
+      // Apps abertos não são interrompidos: só avisa. A instalação antiga de todos os usuários também
+      // fica: ela se atualiza sozinha e removê-la pediria UAC sem a pessoa ter clicado.
+      if (auto && !a.rodando && !a.soMaquina && !busy.has(a.id)) {
         try {
           const r = await install(a.id, { segundoPlano: true });
           if (r.precisaFechar) continue; // foi aberto enquanto procurávamos
-          notify(`${a.nome} atualizado`, `Versão ${r.versao} instalada.`);
+          if (a.mover) movidos.push({ nome: a.nome, removido: r.legadoRemovido });
+          else notify(`${a.nome} atualizado`, `Versão ${r.versao} instalada.`);
         } catch (err) {
           // tenta de novo na próxima verificação, mas avisa só uma vez por versão
           notifyOnce(`falha:${a.id}@${a.ultima.versao}`, `Não foi possível atualizar ${a.nome}`, err.message);
@@ -435,7 +574,30 @@ async function backgroundCheck() {
       }
       notifyOnce(`${a.id}@${a.ultima.versao}`, `Atualização do ${a.nome}`, `A versão ${a.ultima.versao} está disponível. Abra a Central HDL para atualizar.`);
     }
-    if (pending.length) send('estado', await collectState());
+    // Instalado pelo instalador antigo e já com pacote: traz para a Central na mesma versão (não é
+    // atualização, então vale mesmo com "atualizar sozinho" desligado). Os com versão nova já migram acima.
+    const mover = apps.filter((x) => x.mover && !x.atualizacao && !x.rodando && !busy.has(x.id) && !(moverDepois.get(x.id) > Date.now()));
+    for (const a of mover) {
+      try {
+        const r = await install(a.id, { segundoPlano: true });
+        if (r.precisaFechar) continue;
+        moverDepois.delete(a.id);
+        movidos.push({ nome: a.nome, removido: r.legadoRemovido });
+      } catch (err) {
+        // cada tentativa baixa o pacote inteiro: espaça as tentativas e avisa uma vez por versão
+        moverDepois.set(a.id, Date.now() + MOVER_FALHA_ESPERA_MS);
+        notifyOnce(`falha-mover:${a.id}@${a.ultima?.versao}`, `Não foi possível trazer o ${a.nome} para a Central`, err.message);
+      }
+    }
+    if (movidos.length) {
+      const nomes = movidos.map((m) => m.nome);
+      const lista = nomes.length > 1 ? `${nomes.slice(0, -1).join(', ')} e ${nomes.at(-1)}` : nomes[0];
+      const atalhos = movidos.every((m) => m.removido) ? ' Os atalhos antigos foram removidos.' : '';
+      notify('Apps reunidos na Central HDL', `${lista} agora ${nomes.length > 1 ? 'abrem' : 'abre'} pela Central.${atalhos}`);
+    }
+    const sobras = apps.filter((x) => x.limpar && !x.rodando && !busy.has(x.id));
+    for (const a of sobras) await limparLegado(a).catch(() => {});
+    if (pending.length || movidos.length || sobras.length) send('estado', await collectState());
   } catch (err) {
     log.error(`verificação em segundo plano falhou (${err.message})`);
   } finally {
@@ -683,6 +845,9 @@ handle('copiar', (texto) => clipboard.writeText(String(texto ?? '').slice(0, 400
 app.on('second-instance', show);
 app.whenReady().then(() => {
   log.info(`Central ${app.getVersion()} iniciada${process.argv.includes(HIDDEN_ARG) ? ' com o Windows' : ''}`);
+  // antes de qualquer leitura de estado: nenhuma instalação está em andamento agora
+  const recuperados = recuperarTrocas(APPS);
+  if (recuperados.length) log.warn(`troca de versão interrompida; versão em uso recuperada: ${recuperados.join(', ')}`);
   applyLoginItem(readConfig());
   buildTray();
   createWindow({ hidden: process.argv.includes(HIDDEN_ARG) });
